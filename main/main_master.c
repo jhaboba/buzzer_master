@@ -17,6 +17,7 @@
 #include <string.h>
 #include <assert.h>
 #include "freertos/FreeRTOS.h"
+#include "freertos/timers.h"
 #include "nvs_flash.h"
 #include "esp_random.h"
 #include "esp_event.h"
@@ -26,17 +27,65 @@
 #include "esp_mac.h"
 #include "esp_now.h"
 #include "esp_crc.h"
+#include "driver/gpio.h"
 #include "espnow_example.h"
 
 #define ESPNOW_MAXDELAY 512
+#define MASTER_LED_GPIO GPIO_NUM_8
+#define MASTER_LED_ON_LEVEL 0
+#define MASTER_LED_OFF_LEVEL 1
+#define MASTER_LED_BLINK_MS 40
 
 static const char *TAG = "espnow_example";
 
 static QueueHandle_t s_example_espnow_queue = NULL;
+static TimerHandle_t s_master_led_off_timer = NULL;
 static uint8_t s_example_ap_mac[ESP_NOW_ETH_ALEN] = { 0 };
 static uint16_t s_example_espnow_seq = 0;
 
 static void example_espnow_deinit(example_espnow_send_param_t *send_param);
+static void example_master_led_init(void);
+static void example_master_led_blink(void);
+
+static void example_master_led_off_timer_cb(TimerHandle_t xTimer)
+{
+    (void)xTimer;
+    gpio_set_level(MASTER_LED_GPIO, MASTER_LED_OFF_LEVEL);
+}
+
+static void example_master_led_init(void)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = 1ULL << MASTER_LED_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+    ESP_ERROR_CHECK(gpio_set_level(MASTER_LED_GPIO, MASTER_LED_OFF_LEVEL));
+
+    s_master_led_off_timer = xTimerCreate("master_led_off",
+                                          pdMS_TO_TICKS(MASTER_LED_BLINK_MS),
+                                          pdFALSE,
+                                          NULL,
+                                          example_master_led_off_timer_cb);
+    if (s_master_led_off_timer == NULL) {
+        ESP_LOGE(TAG, "Create LED timer fail");
+    }
+}
+
+static void example_master_led_blink(void)
+{
+    if (s_master_led_off_timer == NULL) {
+        return;
+    }
+
+    ESP_ERROR_CHECK(gpio_set_level(MASTER_LED_GPIO, MASTER_LED_ON_LEVEL));
+    xTimerStop(s_master_led_off_timer, 0);
+    xTimerStart(s_master_led_off_timer, 0);
+}
 
 /* WiFi should start before using ESPNOW */
 static void example_wifi_init(void)
@@ -181,6 +230,7 @@ static void example_espnow_task(void *pvParameter)
             case EXAMPLE_ESPNOW_RECV_CB:
             {
                 example_espnow_event_recv_cb_t *recv_cb = &evt.info.recv_cb;
+                example_master_led_blink();
 
                 ret = example_espnow_data_parse(recv_cb->data, recv_cb->data_len, &recv_state, &recv_seq, &recv_magic);
                 free(recv_cb->data);
@@ -289,6 +339,11 @@ static esp_err_t example_espnow_init(void)
 
 static void example_espnow_deinit(example_espnow_send_param_t *send_param)
 {
+    if (s_master_led_off_timer != NULL) {
+        xTimerStop(s_master_led_off_timer, portMAX_DELAY);
+        xTimerDelete(s_master_led_off_timer, portMAX_DELAY);
+        s_master_led_off_timer = NULL;
+    }
     free(send_param->buffer);
     free(send_param);
     vQueueDelete(s_example_espnow_queue);
@@ -306,6 +361,7 @@ void app_main(void)
     }
     ESP_ERROR_CHECK( ret );
 
+    example_master_led_init();
     example_wifi_init();
     example_espnow_init();
 }
