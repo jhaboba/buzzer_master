@@ -50,7 +50,7 @@ static void example_wifi_init(void)
     ESP_ERROR_CHECK( esp_wifi_start());
     ESP_ERROR_CHECK( esp_wifi_set_channel(CONFIG_ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
     ESP_ERROR_CHECK( esp_wifi_get_mac(ESP_IF_WIFI_AP, s_example_ap_mac) );
-    ESP_LOGI(TAG, "Local AP MAC: "MACSTR, MAC2STR(s_example_ap_mac));
+    ESP_LOGI(TAG, "--- MASTER APP Local AP MAC: "MACSTR, MAC2STR(s_example_ap_mac));
 
 #if CONFIG_ESPNOW_ENABLE_LONG_RANGE
     ESP_ERROR_CHECK( esp_wifi_set_protocol(ESP_IF_WIFI_AP, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N|WIFI_PROTOCOL_LR) );
@@ -168,6 +168,8 @@ static void example_espnow_task(void *pvParameter)
     int ret;
     example_espnow_send_param_t *send_param = (example_espnow_send_param_t *)pvParameter;
 
+    ESP_LOGI(TAG, "Start receiving data");
+
     while (xQueueReceive(s_example_espnow_queue, &evt, portMAX_DELAY) == pdTRUE) {
         switch (evt.id) {
             case EXAMPLE_ESPNOW_SEND_CB:
@@ -201,8 +203,7 @@ static void example_espnow_task(void *pvParameter)
                     memset(peer, 0, sizeof(esp_now_peer_info_t));
                     peer->channel = CONFIG_ESPNOW_CHANNEL;
                     peer->ifidx = ESP_IF_WIFI_AP;
-                    peer->encrypt = true;
-                    memcpy(peer->lmk, CONFIG_ESPNOW_LMK, ESP_NOW_KEY_LEN);
+                    peer->encrypt = false;
                     memcpy(peer->peer_addr, recv_cb->mac_addr, ESP_NOW_ETH_ALEN);
                     ESP_ERROR_CHECK( esp_now_add_peer(peer) );
                     free(peer);
@@ -252,9 +253,6 @@ static esp_err_t example_espnow_init(void)
     ESP_ERROR_CHECK( esp_now_set_wake_window(CONFIG_ESPNOW_WAKE_WINDOW) );
     ESP_ERROR_CHECK( esp_wifi_connectionless_module_set_wake_interval(CONFIG_ESPNOW_WAKE_INTERVAL) );
 #endif
-    /* Set primary master key. */
-    ESP_ERROR_CHECK( esp_now_set_pmk((uint8_t *)CONFIG_ESPNOW_PMK) );
-
     /* Initialize sending parameters. */
     send_param = malloc(sizeof(example_espnow_send_param_t));
     if (send_param == NULL) {
