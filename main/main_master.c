@@ -259,11 +259,6 @@ static void example_espnow_task(void *pvParameter)
                     free(peer);
                 }
 
-                if (send_param->count == 0) {
-                    ESP_LOGI(TAG, "Send count reached zero, skip response");
-                    break;
-                }
-
                 memcpy(send_param->dest_mac, recv_cb->mac_addr, ESP_NOW_ETH_ALEN);
                 example_espnow_data_prepare(send_param);
                 if (esp_now_send(send_param->dest_mac, send_param->buffer, send_param->len) != ESP_OK) {
@@ -272,10 +267,6 @@ static void example_espnow_task(void *pvParameter)
                     vTaskDelete(NULL);
                 }
 
-                send_param->count--;
-                if (send_param->delay > 0) {
-                    vTaskDelay(send_param->delay / portTICK_PERIOD_MS);
-                }
                 break;
             }
             default:
@@ -317,8 +308,8 @@ static esp_err_t example_espnow_init(void)
     send_param->broadcast = false;
     send_param->state = 1;
     send_param->magic = esp_random();
-    send_param->count = CONFIG_ESPNOW_SEND_COUNT;
-    send_param->delay = CONFIG_ESPNOW_SEND_DELAY;
+    // send_param->count = CONFIG_ESPNOW_SEND_COUNT;
+    // send_param->delay = CONFIG_ESPNOW_SEND_DELAY;
     send_param->len = CONFIG_ESPNOW_SEND_LEN;
     send_param->buffer = malloc(CONFIG_ESPNOW_SEND_LEN);
     if (send_param->buffer == NULL) {
