@@ -14,6 +14,7 @@
 */
 #include <stdlib.h>
 #include <inttypes.h>
+#include <math.h>
 #include <string.h>
 #include <assert.h>
 #include "freertos/FreeRTOS.h"
@@ -38,23 +39,34 @@
 #define MASTER_LED_OFF_LEVEL 1
 #define MASTER_LED_BLINK_MS 40
 #define MASTER_BUZZER_GPIO GPIO_NUM_1
-#define MASTER_BUZZER_SAMPLE_RATE_HZ 4000
-#define MASTER_BUZZER_NUM_SAMPLES 4000
-#define MASTER_BUZZER_SAMPLE_US 250
+#define MASTER_BUZZER_SAMPLE_RATE_HZ 2000
+#define MASTER_BUZZER_NUM_SAMPLES 2000
+#define MASTER_BUZZER_SAMPLE_US 500
 #define MASTER_BUZZER_LEDC_MODE LEDC_LOW_SPEED_MODE
 #define MASTER_BUZZER_LEDC_TIMER LEDC_TIMER_0
 #define MASTER_BUZZER_LEDC_CHANNEL LEDC_CHANNEL_0
 #define MASTER_BUZZER_DUTY_RES LEDC_TIMER_10_BIT
-#define MASTER_BUZZER_DUTY 512
+#define MASTER_BUZZER_MAX_DUTY ((1U << 10) - 1U)
+#define MASTER_BUZZER_DUTY_CENTER 512
+#define MASTER_BUZZER_DUTY_SWING 310
+#define MASTER_BUZZER_USE_STATIC_HEADER_TABLE 0
+#define MASTER_BUZZER_PI 3.14159265358979323846f
+#define MASTER_BUZZER_DYNAMIC_FREQ1_HZ 110.0f
+#define MASTER_BUZZER_DYNAMIC_FREQ2_HZ 165.0f
+#define MASTER_BUZZER_DYNAMIC_T_FS_HZ 2000.0f
 
 static const char *TAG = "espnow_example";
 
 static QueueHandle_t s_example_espnow_queue = NULL;
 static TimerHandle_t s_master_led_off_timer = NULL;
 static bool s_master_buzzer_inited = false;
+#if MASTER_BUZZER_USE_STATIC_HEADER_TABLE
 static const uint16_t s_master_error_beep_samples[MASTER_BUZZER_NUM_SAMPLES] = {
 #include "master_error_beep_samples.h"
 };
+#else
+static uint16_t s_master_error_beep_samples[MASTER_BUZZER_NUM_SAMPLES];
+#endif
 static uint8_t s_example_ap_mac[ESP_NOW_ETH_ALEN] = { 0 };
 static uint16_t s_example_espnow_seq = 0;
 
@@ -62,6 +74,7 @@ static void example_espnow_deinit(example_espnow_send_param_t *send_param);
 static void example_master_led_init(void);
 static void example_master_led_blink(void);
 static void example_master_buzzer_init(void);
+static void example_master_buzzer_prepare_table(void);
 void example_master_buzzer_beep_1s(void);
 
 static void example_master_led_off_timer_cb(TimerHandle_t xTimer)
@@ -130,7 +143,30 @@ static void example_master_buzzer_init(void)
     };
     ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
 
+    example_master_buzzer_prepare_table();
     s_master_buzzer_inited = true;
+}
+
+static void example_master_buzzer_prepare_table(void)
+{
+#if !MASTER_BUZZER_USE_STATIC_HEADER_TABLE
+    const float w1 = 2.0f * MASTER_BUZZER_PI * MASTER_BUZZER_DYNAMIC_FREQ1_HZ;
+    const float w2 = 2.0f * MASTER_BUZZER_PI * MASTER_BUZZER_DYNAMIC_FREQ2_HZ;
+
+    for (size_t i = 0; i < MASTER_BUZZER_NUM_SAMPLES; i++) {
+        float t = (float)i / MASTER_BUZZER_DYNAMIC_T_FS_HZ;
+        float x = (sinf(w1 * t) + sinf(w2 * t)) * 0.5f;
+        int32_t duty = (int32_t)((float)MASTER_BUZZER_DUTY_CENTER + ((float)MASTER_BUZZER_DUTY_SWING * x));
+
+        if (duty < 0) {
+            duty = 0;
+        } else if (duty > (int32_t)MASTER_BUZZER_MAX_DUTY) {
+            duty = MASTER_BUZZER_MAX_DUTY;
+        }
+
+        s_master_error_beep_samples[i] = (uint16_t)duty;
+    }
+#endif
 }
 
 void example_master_buzzer_beep_1s(void)
