@@ -28,6 +28,7 @@
 #include "esp_now.h"
 #include "esp_crc.h"
 #include "driver/gpio.h"
+#include "driver/ledc.h"
 #include "espnow_example.h"
 
 #define ESPNOW_MAXDELAY 512
@@ -35,17 +36,45 @@
 #define MASTER_LED_ON_LEVEL 0
 #define MASTER_LED_OFF_LEVEL 1
 #define MASTER_LED_BLINK_MS 40
+#define MASTER_BUZZER_GPIO GPIO_NUM_1
+#define MASTER_BUZZER_BASE_FREQ_HZ 430
+#define MASTER_BUZZER_LEDC_MODE LEDC_LOW_SPEED_MODE
+#define MASTER_BUZZER_LEDC_TIMER LEDC_TIMER_0
+#define MASTER_BUZZER_LEDC_CHANNEL LEDC_CHANNEL_0
+#define MASTER_BUZZER_DUTY_RES LEDC_TIMER_10_BIT
+#define MASTER_BUZZER_DUTY 512
+
+typedef struct {
+    uint16_t freq_hz;
+    uint16_t duration_ms;
+    uint16_t duty;
+} example_master_buzzer_step_t;
+
+/* 1 second, table-driven low-pitch error sound with quick arpeggio slices. */
+static const example_master_buzzer_step_t s_master_error_beep_steps[] = {
+    {430, 40, 640}, {645, 40, 360}, {480, 40, 560}, {0, 40, 0},
+    {420, 40, 620}, {630, 40, 350}, {470, 40, 540}, {0, 40, 0},
+    {390, 40, 600}, {585, 40, 340}, {440, 40, 520}, {0, 40, 0},
+    {360, 40, 580}, {540, 40, 330}, {405, 40, 500}, {0, 40, 0},
+    {330, 40, 560}, {495, 40, 320}, {370, 40, 480}, {0, 40, 0},
+    {300, 40, 540}, {450, 40, 310}, {340, 40, 460}, {0, 40, 0},
+    {260, 40, 520},
+};
 
 static const char *TAG = "espnow_example";
 
 static QueueHandle_t s_example_espnow_queue = NULL;
 static TimerHandle_t s_master_led_off_timer = NULL;
+static bool s_master_buzzer_inited = false;
 static uint8_t s_example_ap_mac[ESP_NOW_ETH_ALEN] = { 0 };
 static uint16_t s_example_espnow_seq = 0;
 
 static void example_espnow_deinit(example_espnow_send_param_t *send_param);
 static void example_master_led_init(void);
 static void example_master_led_blink(void);
+static void example_master_buzzer_init(void);
+static void example_master_buzzer_step(const example_master_buzzer_step_t *step);
+void example_master_buzzer_beep_1s(void);
 
 static void example_master_led_off_timer_cb(TimerHandle_t xTimer)
 {
@@ -85,6 +114,66 @@ static void example_master_led_blink(void)
     ESP_ERROR_CHECK(gpio_set_level(MASTER_LED_GPIO, MASTER_LED_ON_LEVEL));
     xTimerStop(s_master_led_off_timer, 0);
     xTimerStart(s_master_led_off_timer, 0);
+}
+
+static void example_master_buzzer_init(void)
+{
+    if (s_master_buzzer_inited) {
+        return;
+    }
+
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode = MASTER_BUZZER_LEDC_MODE,
+        .duty_resolution = MASTER_BUZZER_DUTY_RES,
+        .timer_num = MASTER_BUZZER_LEDC_TIMER,
+        .freq_hz = MASTER_BUZZER_BASE_FREQ_HZ,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+
+    ledc_channel_config_t ledc_channel = {
+        .gpio_num = MASTER_BUZZER_GPIO,
+        .speed_mode = MASTER_BUZZER_LEDC_MODE,
+        .channel = MASTER_BUZZER_LEDC_CHANNEL,
+        .intr_type = LEDC_INTR_DISABLE,
+        .timer_sel = MASTER_BUZZER_LEDC_TIMER,
+        .duty = 0,
+        .hpoint = 0,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
+
+    s_master_buzzer_inited = true;
+}
+
+static void example_master_buzzer_step(const example_master_buzzer_step_t *step)
+{
+    if (step->freq_hz == 0 || step->duty == 0) {
+        ESP_ERROR_CHECK(ledc_set_duty(MASTER_BUZZER_LEDC_MODE, MASTER_BUZZER_LEDC_CHANNEL, 0));
+        ESP_ERROR_CHECK(ledc_update_duty(MASTER_BUZZER_LEDC_MODE, MASTER_BUZZER_LEDC_CHANNEL));
+        vTaskDelay(pdMS_TO_TICKS(step->duration_ms));
+        return;
+    }
+
+    ESP_ERROR_CHECK(ledc_set_freq(MASTER_BUZZER_LEDC_MODE, MASTER_BUZZER_LEDC_TIMER, step->freq_hz));
+    ESP_ERROR_CHECK(ledc_set_duty(MASTER_BUZZER_LEDC_MODE, MASTER_BUZZER_LEDC_CHANNEL, step->duty));
+    ESP_ERROR_CHECK(ledc_update_duty(MASTER_BUZZER_LEDC_MODE, MASTER_BUZZER_LEDC_CHANNEL));
+    vTaskDelay(pdMS_TO_TICKS(step->duration_ms));
+}
+
+void example_master_buzzer_beep_1s(void)
+{
+    size_t i;
+
+    if (!s_master_buzzer_inited) {
+        example_master_buzzer_init();
+    }
+
+    for (i = 0; i < (sizeof(s_master_error_beep_steps) / sizeof(s_master_error_beep_steps[0])); i++) {
+        example_master_buzzer_step(&s_master_error_beep_steps[i]);
+    }
+
+    ESP_ERROR_CHECK(ledc_set_duty(MASTER_BUZZER_LEDC_MODE, MASTER_BUZZER_LEDC_CHANNEL, 0));
+    ESP_ERROR_CHECK(ledc_update_duty(MASTER_BUZZER_LEDC_MODE, MASTER_BUZZER_LEDC_CHANNEL));
 }
 
 /* WiFi should start before using ESPNOW */
@@ -231,6 +320,7 @@ static void example_espnow_task(void *pvParameter)
             {
                 example_espnow_event_recv_cb_t *recv_cb = &evt.info.recv_cb;
                 example_master_led_blink();
+                
 
                 ret = example_espnow_data_parse(recv_cb->data, recv_cb->data_len, &recv_state, &recv_seq, &recv_magic);
                 free(recv_cb->data);
@@ -266,6 +356,7 @@ static void example_espnow_task(void *pvParameter)
                     example_espnow_deinit(send_param);
                     vTaskDelete(NULL);
                 }
+                example_master_buzzer_beep_1s();
 
                 break;
             }
@@ -353,6 +444,7 @@ void app_main(void)
     ESP_ERROR_CHECK( ret );
 
     example_master_led_init();
+    example_master_buzzer_init();
     example_wifi_init();
     example_espnow_init();
 }
