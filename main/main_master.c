@@ -41,16 +41,15 @@
 #define MASTER_I2S_WS_GPIO GPIO_NUM_5
 #define MASTER_I2S_DOUT_GPIO GPIO_NUM_1
 #define MASTER_I2S_SAMPLE_RATE_HZ 16000
-#define MASTER_BUZZER_SAMPLE_RATE_HZ 330
-#define MASTER_BUZZER_NUM_SAMPLES 330
-#define MASTER_BUZZER_MAX_DUTY ((1U << 10) - 1U)
+#define MASTER_BUZZER_SAMPLE_RATE_HZ 1000
+#define MASTER_BUZZER_NUM_SAMPLES 1000
 #define MASTER_BUZZER_DUTY_CENTER 512
-#define MASTER_BUZZER_DUTY_SWING 511
+#define MASTER_BUZZER_DYNAMIC_PCM_PEAK 32000
 #define MASTER_BUZZER_USE_STATIC_HEADER_TABLE 0
 #define MASTER_BUZZER_PI 3.14159265358979323846f
-#define MASTER_BUZZER_DYNAMIC_FREQ1_HZ 110.0f
-#define MASTER_BUZZER_DYNAMIC_FREQ2_HZ 165.0f
-#define MASTER_BUZZER_DYNAMIC_T_FS_HZ 330.0f
+#define MASTER_BUZZER_DYNAMIC_FREQ1_HZ 220.0f
+#define MASTER_BUZZER_DYNAMIC_FREQ2_HZ 440.0f
+#define MASTER_BUZZER_DYNAMIC_T_FS_HZ 1000.0f
 #define MASTER_BEEP_DURATION_MS 1000
 #define MASTER_I2S_PLAYBACK_SAMPLES ((MASTER_I2S_SAMPLE_RATE_HZ * MASTER_BEEP_DURATION_MS) / 1000)
 
@@ -66,7 +65,7 @@ static const uint16_t s_master_error_beep_samples[MASTER_BUZZER_NUM_SAMPLES] = {
 #include "master_error_beep_samples.h"
 };
 #else
-static uint16_t s_master_error_beep_samples[MASTER_BUZZER_NUM_SAMPLES];
+static int16_t s_master_error_beep_samples[MASTER_BUZZER_NUM_SAMPLES];
 #endif
 static uint8_t s_example_ap_mac[ESP_NOW_ETH_ALEN] = { 0 };
 static uint16_t s_example_espnow_seq = 0;
@@ -119,11 +118,13 @@ static void example_master_led_blink(void)
     xTimerStart(s_master_led_off_timer, 0);
 }
 
+#if MASTER_BUZZER_USE_STATIC_HEADER_TABLE
 static int16_t example_master_buzzer_sample_to_pcm(uint16_t sample)
 {
     int32_t centered = (int32_t)sample - MASTER_BUZZER_DUTY_CENTER;
     return (int16_t)(centered * 64);
 }
+#endif
 
 static void example_master_buzzer_init(void)
 {
@@ -160,15 +161,15 @@ static void example_master_buzzer_prepare_table(void)
     for (size_t i = 0; i < MASTER_BUZZER_NUM_SAMPLES; i++) {
         float t = (float)i / MASTER_BUZZER_DYNAMIC_T_FS_HZ;
         float x = (sinf(w1 * t) + sinf(w2 * t)) * 0.5f;
-        int32_t duty = (int32_t)((float)MASTER_BUZZER_DUTY_CENTER + ((float)MASTER_BUZZER_DUTY_SWING * x));
+        int32_t pcm = (int32_t)((float)MASTER_BUZZER_DYNAMIC_PCM_PEAK * x);
 
-        if (duty < 0) {
-            duty = 0;
-        } else if (duty > (int32_t)MASTER_BUZZER_MAX_DUTY) {
-            duty = MASTER_BUZZER_MAX_DUTY;
+        if (pcm < INT16_MIN) {
+            pcm = INT16_MIN;
+        } else if (pcm > INT16_MAX) {
+            pcm = INT16_MAX;
         }
 
-        s_master_error_beep_samples[i] = (uint16_t)duty;
+        s_master_error_beep_samples[i] = (int16_t)pcm;
     }
 #endif
 }
@@ -182,7 +183,11 @@ static void example_master_buzzer_prepare_pcm(void)
         if (table_idx >= MASTER_BUZZER_NUM_SAMPLES) {
             table_idx = MASTER_BUZZER_NUM_SAMPLES - 1;
         }
+#if MASTER_BUZZER_USE_STATIC_HEADER_TABLE
         pcm_sample = example_master_buzzer_sample_to_pcm(s_master_error_beep_samples[table_idx]);
+#else
+        pcm_sample = s_master_error_beep_samples[table_idx];
+#endif
         s_master_beep_pcm[(i * 2)] = pcm_sample;
         s_master_beep_pcm[(i * 2) + 1] = pcm_sample;
     }
