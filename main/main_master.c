@@ -29,8 +29,7 @@
 #include "esp_now.h"
 #include "esp_crc.h"
 #include "driver/gpio.h"
-#include "driver/ledc.h"
-#include "esp_rom_sys.h"
+#include "driver/i2s_std.h"
 #include "espnow_example.h"
 
 #define ESPNOW_MAXDELAY 512
@@ -38,14 +37,12 @@
 #define MASTER_LED_ON_LEVEL 0
 #define MASTER_LED_OFF_LEVEL 1
 #define MASTER_LED_BLINK_MS 40
-#define MASTER_BUZZER_GPIO GPIO_NUM_1
+#define MASTER_I2S_BCLK_GPIO GPIO_NUM_4
+#define MASTER_I2S_WS_GPIO GPIO_NUM_5
+#define MASTER_I2S_DOUT_GPIO GPIO_NUM_1
+#define MASTER_I2S_SAMPLE_RATE_HZ 16000
 #define MASTER_BUZZER_SAMPLE_RATE_HZ 330
 #define MASTER_BUZZER_NUM_SAMPLES 330
-#define MASTER_BUZZER_SAMPLE_US 3030
-#define MASTER_BUZZER_LEDC_MODE LEDC_LOW_SPEED_MODE
-#define MASTER_BUZZER_LEDC_TIMER LEDC_TIMER_0
-#define MASTER_BUZZER_LEDC_CHANNEL LEDC_CHANNEL_0
-#define MASTER_BUZZER_DUTY_RES LEDC_TIMER_10_BIT
 #define MASTER_BUZZER_MAX_DUTY ((1U << 10) - 1U)
 #define MASTER_BUZZER_DUTY_CENTER 512
 #define MASTER_BUZZER_DUTY_SWING 511
@@ -54,12 +51,16 @@
 #define MASTER_BUZZER_DYNAMIC_FREQ1_HZ 110.0f
 #define MASTER_BUZZER_DYNAMIC_FREQ2_HZ 165.0f
 #define MASTER_BUZZER_DYNAMIC_T_FS_HZ 330.0f
+#define MASTER_BEEP_DURATION_MS 1000
+#define MASTER_I2S_PLAYBACK_SAMPLES ((MASTER_I2S_SAMPLE_RATE_HZ * MASTER_BEEP_DURATION_MS) / 1000)
 
 static const char *TAG = "espnow_example";
 
 static QueueHandle_t s_example_espnow_queue = NULL;
 static TimerHandle_t s_master_led_off_timer = NULL;
 static bool s_master_buzzer_inited = false;
+static i2s_chan_handle_t s_master_i2s_tx_chan = NULL;
+static int16_t s_master_beep_pcm[MASTER_I2S_PLAYBACK_SAMPLES * 2];
 #if MASTER_BUZZER_USE_STATIC_HEADER_TABLE
 static const uint16_t s_master_error_beep_samples[MASTER_BUZZER_NUM_SAMPLES] = {
 #include "master_error_beep_samples.h"
@@ -75,6 +76,7 @@ static void example_master_led_init(void);
 static void example_master_led_blink(void);
 static void example_master_buzzer_init(void);
 static void example_master_buzzer_prepare_table(void);
+static void example_master_buzzer_prepare_pcm(void);
 void example_master_buzzer_beep_1s(void);
 
 static void example_master_led_off_timer_cb(TimerHandle_t xTimer)
@@ -117,33 +119,35 @@ static void example_master_led_blink(void)
     xTimerStart(s_master_led_off_timer, 0);
 }
 
+static int16_t example_master_buzzer_sample_to_pcm(uint16_t sample)
+{
+    int32_t centered = (int32_t)sample - MASTER_BUZZER_DUTY_CENTER;
+    return (int16_t)(centered * 64);
+}
+
 static void example_master_buzzer_init(void)
 {
     if (s_master_buzzer_inited) {
         return;
     }
 
-    ledc_timer_config_t ledc_timer = {
-        .speed_mode = MASTER_BUZZER_LEDC_MODE,
-        .duty_resolution = MASTER_BUZZER_DUTY_RES,
-        .timer_num = MASTER_BUZZER_LEDC_TIMER,
-        .freq_hz = MASTER_BUZZER_SAMPLE_RATE_HZ,
-        .clk_cfg = LEDC_AUTO_CLK,
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(MASTER_I2S_SAMPLE_RATE_HZ),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = MASTER_I2S_BCLK_GPIO,
+            .ws = MASTER_I2S_WS_GPIO,
+            .dout = MASTER_I2S_DOUT_GPIO,
+            .din = I2S_GPIO_UNUSED,
+        },
     };
-    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
-
-    ledc_channel_config_t ledc_channel = {
-        .gpio_num = MASTER_BUZZER_GPIO,
-        .speed_mode = MASTER_BUZZER_LEDC_MODE,
-        .channel = MASTER_BUZZER_LEDC_CHANNEL,
-        .intr_type = LEDC_INTR_DISABLE,
-        .timer_sel = MASTER_BUZZER_LEDC_TIMER,
-        .duty = 0,
-        .hpoint = 0,
-    };
-    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
 
     example_master_buzzer_prepare_table();
+    example_master_buzzer_prepare_pcm();
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &s_master_i2s_tx_chan, NULL));
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_master_i2s_tx_chan, &std_cfg));
     s_master_buzzer_inited = true;
 }
 
@@ -169,22 +173,55 @@ static void example_master_buzzer_prepare_table(void)
 #endif
 }
 
+static void example_master_buzzer_prepare_pcm(void)
+{
+    for (size_t i = 0; i < MASTER_I2S_PLAYBACK_SAMPLES; i++) {
+        uint32_t table_idx = (uint32_t)(((uint64_t)i * MASTER_BUZZER_NUM_SAMPLES) / MASTER_I2S_PLAYBACK_SAMPLES);
+        int16_t pcm_sample;
+
+        if (table_idx >= MASTER_BUZZER_NUM_SAMPLES) {
+            table_idx = MASTER_BUZZER_NUM_SAMPLES - 1;
+        }
+        pcm_sample = example_master_buzzer_sample_to_pcm(s_master_error_beep_samples[table_idx]);
+        s_master_beep_pcm[(i * 2)] = pcm_sample;
+        s_master_beep_pcm[(i * 2) + 1] = pcm_sample;
+    }
+}
+
 void example_master_buzzer_beep_1s(void)
 {
-    size_t i;
+    size_t bytes_written = 0;
+    static const int16_t s_silence_tail[128] = { 0 };
+    esp_err_t err;
 
     if (!s_master_buzzer_inited) {
         example_master_buzzer_init();
     }
 
-    for (i = 0; i < MASTER_BUZZER_NUM_SAMPLES; i++) {
-        (void)ledc_set_duty(MASTER_BUZZER_LEDC_MODE, MASTER_BUZZER_LEDC_CHANNEL, s_master_error_beep_samples[i]);
-        (void)ledc_update_duty(MASTER_BUZZER_LEDC_MODE, MASTER_BUZZER_LEDC_CHANNEL);
-        esp_rom_delay_us(MASTER_BUZZER_SAMPLE_US);
+    if (s_master_i2s_tx_chan == NULL) {
+        return;
     }
 
-    ESP_ERROR_CHECK(ledc_set_duty(MASTER_BUZZER_LEDC_MODE, MASTER_BUZZER_LEDC_CHANNEL, 0));
-    ESP_ERROR_CHECK(ledc_update_duty(MASTER_BUZZER_LEDC_MODE, MASTER_BUZZER_LEDC_CHANNEL));
+    err = i2s_channel_enable(s_master_i2s_tx_chan);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(err);
+    }
+
+    ESP_ERROR_CHECK(i2s_channel_write(s_master_i2s_tx_chan,
+                                      s_master_beep_pcm,
+                                      sizeof(s_master_beep_pcm),
+                                      &bytes_written,
+                                      pdMS_TO_TICKS(1200)));
+    ESP_ERROR_CHECK(i2s_channel_write(s_master_i2s_tx_chan,
+                                      s_silence_tail,
+                                      sizeof(s_silence_tail),
+                                      &bytes_written,
+                                      pdMS_TO_TICKS(50)));
+
+    err = i2s_channel_disable(s_master_i2s_tx_chan);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(err);
+    }
 }
 
 /* WiFi should start before using ESPNOW */
@@ -436,6 +473,14 @@ static void example_espnow_deinit(example_espnow_send_param_t *send_param)
         xTimerStop(s_master_led_off_timer, portMAX_DELAY);
         xTimerDelete(s_master_led_off_timer, portMAX_DELAY);
         s_master_led_off_timer = NULL;
+    }
+    if (s_master_i2s_tx_chan != NULL) {
+        esp_err_t err = i2s_channel_disable(s_master_i2s_tx_chan);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "i2s disable failed: %s", esp_err_to_name(err));
+        }
+        i2s_del_channel(s_master_i2s_tx_chan);
+        s_master_i2s_tx_chan = NULL;
     }
     free(send_param->buffer);
     free(send_param);
