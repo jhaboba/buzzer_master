@@ -37,6 +37,8 @@
 #define MASTER_LED_ON_LEVEL 0
 #define MASTER_LED_OFF_LEVEL 1
 #define MASTER_LED_BLINK_MS 40
+#define MASTER_TRIGGER_GPIO GPIO_NUM_0
+#define MASTER_TRIGGER_DEBOUNCE_MS 120
 #define MASTER_I2S_BCLK_GPIO GPIO_NUM_4
 #define MASTER_I2S_WS_GPIO GPIO_NUM_5
 #define MASTER_I2S_DOUT_GPIO GPIO_NUM_1
@@ -58,6 +60,7 @@ static const char *TAG = "espnow_example";
 static QueueHandle_t s_example_espnow_queue = NULL;
 static TimerHandle_t s_master_led_off_timer = NULL;
 static bool s_master_buzzer_inited = false;
+static volatile TickType_t s_last_gpio_trigger_tick = 0;
 static i2s_chan_handle_t s_master_i2s_tx_chan = NULL;
 static int16_t s_master_beep_pcm[MASTER_I2S_PLAYBACK_SAMPLES * 2];
 #if MASTER_BUZZER_USE_STATIC_HEADER_TABLE
@@ -73,6 +76,7 @@ static uint16_t s_example_espnow_seq = 0;
 static void example_espnow_deinit(example_espnow_send_param_t *send_param);
 static void example_master_led_init(void);
 static void example_master_led_blink(void);
+static void example_master_gpio_init(void);
 static void example_master_buzzer_init(void);
 static void example_master_buzzer_prepare_table(void);
 static void example_master_buzzer_prepare_pcm(void);
@@ -116,6 +120,47 @@ static void example_master_led_blink(void)
     ESP_ERROR_CHECK(gpio_set_level(MASTER_LED_GPIO, MASTER_LED_ON_LEVEL));
     xTimerStop(s_master_led_off_timer, 0);
     xTimerStart(s_master_led_off_timer, 0);
+}
+
+static void IRAM_ATTR example_master_gpio_isr_handler(void *arg)
+{
+    (void)arg;
+    BaseType_t high_task_wakeup = pdFALSE;
+    TickType_t now = xTaskGetTickCountFromISR();
+    example_espnow_event_t evt = { .id = EXAMPLE_ESPNOW_GPIO_CB };
+
+    if (s_example_espnow_queue == NULL) {
+        return;
+    }
+    if ((now - s_last_gpio_trigger_tick) < pdMS_TO_TICKS(MASTER_TRIGGER_DEBOUNCE_MS)) {
+        return;
+    }
+    s_last_gpio_trigger_tick = now;
+
+    xQueueSendFromISR(s_example_espnow_queue, &evt, &high_task_wakeup);
+    if (high_task_wakeup == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
+}
+
+static void example_master_gpio_init(void)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = 1ULL << MASTER_TRIGGER_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_NEGEDGE,
+    };
+    esp_err_t err;
+
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+    err = gpio_install_isr_service(0);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(err);
+    }
+    ESP_ERROR_CHECK(gpio_isr_handler_add(MASTER_TRIGGER_GPIO, example_master_gpio_isr_handler, NULL));
+    ESP_LOGI(TAG, "GPIO0 button enabled (pull-up, active low)");
 }
 
 #if MASTER_BUZZER_USE_STATIC_HEADER_TABLE
@@ -413,6 +458,11 @@ static void example_espnow_task(void *pvParameter)
 
                 break;
             }
+            case EXAMPLE_ESPNOW_GPIO_CB:
+            {
+                ESP_LOGI(TAG, "GPIO0 button pressed");
+                break;
+            }
             default:
                 ESP_LOGE(TAG, "Callback type error: %d", evt.id);
                 break;
@@ -429,6 +479,7 @@ static esp_err_t example_espnow_init(void)
         ESP_LOGE(TAG, "Create queue fail");
         return ESP_FAIL;
     }
+    example_master_gpio_init();
 
     /* Initialize ESPNOW and register sending and receiving callback function. */
     ESP_ERROR_CHECK( esp_now_init() );
@@ -479,6 +530,7 @@ static void example_espnow_deinit(example_espnow_send_param_t *send_param)
         xTimerDelete(s_master_led_off_timer, portMAX_DELAY);
         s_master_led_off_timer = NULL;
     }
+    gpio_isr_handler_remove(MASTER_TRIGGER_GPIO);
     if (s_master_i2s_tx_chan != NULL) {
         esp_err_t err = i2s_channel_disable(s_master_i2s_tx_chan);
         if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
