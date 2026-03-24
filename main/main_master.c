@@ -37,6 +37,10 @@
 #define MASTER_LED_ON_LEVEL 0
 #define MASTER_LED_OFF_LEVEL 1
 #define MASTER_LED_BLINK_MS 40
+#define BUTTON_LED_GPIO GPIO_NUM_2
+#define BUTTON_LED_ON_LEVEL 1
+#define BUTTON_LED_OFF_LEVEL 0
+#define BUTTON_LED_BLINK_MS 1000
 #define MASTER_TRIGGER_GPIO GPIO_NUM_0
 #define MASTER_TRIGGER_DEBOUNCE_MS 120
 #define MASTER_I2S_BCLK_GPIO GPIO_NUM_4
@@ -59,6 +63,7 @@ static const char *TAG = "espnow_example";
 
 static QueueHandle_t s_example_espnow_queue = NULL;
 static TimerHandle_t s_master_led_off_timer = NULL;
+static TimerHandle_t s_button_led_off_timer = NULL;
 static bool s_master_buzzer_inited = false;
 static volatile TickType_t s_last_gpio_trigger_tick = 0;
 static i2s_chan_handle_t s_master_i2s_tx_chan = NULL;
@@ -76,6 +81,8 @@ static uint16_t s_example_espnow_seq = 0;
 static void example_espnow_deinit(example_espnow_send_param_t *send_param);
 static void example_master_led_init(void);
 static void example_master_led_blink(void);
+static void button_led_init(void);
+static void button_blink(void);
 static void example_master_gpio_init(void);
 static void example_master_buzzer_init(void);
 static void example_master_buzzer_prepare_table(void);
@@ -86,6 +93,12 @@ static void example_master_led_off_timer_cb(TimerHandle_t xTimer)
 {
     (void)xTimer;
     gpio_set_level(MASTER_LED_GPIO, MASTER_LED_OFF_LEVEL);
+}
+
+static void button_led_off_timer_cb(TimerHandle_t xTimer)
+{
+    (void)xTimer;
+    gpio_set_level(BUTTON_LED_GPIO, BUTTON_LED_OFF_LEVEL);
 }
 
 static void example_master_led_init(void)
@@ -120,6 +133,40 @@ static void example_master_led_blink(void)
     ESP_ERROR_CHECK(gpio_set_level(MASTER_LED_GPIO, MASTER_LED_ON_LEVEL));
     xTimerStop(s_master_led_off_timer, 0);
     xTimerStart(s_master_led_off_timer, 0);
+}
+
+static void button_led_init(void)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = 1ULL << BUTTON_LED_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+    ESP_ERROR_CHECK(gpio_set_level(BUTTON_LED_GPIO, BUTTON_LED_OFF_LEVEL));
+
+    s_button_led_off_timer = xTimerCreate("button_led_off",
+                                          pdMS_TO_TICKS(BUTTON_LED_BLINK_MS),
+                                          pdFALSE,
+                                          NULL,
+                                          button_led_off_timer_cb);
+    if (s_button_led_off_timer == NULL) {
+        ESP_LOGE(TAG, "Create button LED timer fail");
+    }
+}
+
+static void button_blink(void)
+{
+    if (s_button_led_off_timer == NULL) {
+        return;
+    }
+
+    ESP_ERROR_CHECK(gpio_set_level(BUTTON_LED_GPIO, BUTTON_LED_ON_LEVEL));
+    xTimerStop(s_button_led_off_timer, 0);
+    xTimerStart(s_button_led_off_timer, 0);
 }
 
 static void IRAM_ATTR example_master_gpio_isr_handler(void *arg)
@@ -418,6 +465,7 @@ static void example_espnow_task(void *pvParameter)
             {
                 example_espnow_event_recv_cb_t *recv_cb = &evt.info.recv_cb;
                 example_master_led_blink();
+                button_blink();
                 
 
                 ret = example_espnow_data_parse(recv_cb->data, recv_cb->data_len, &recv_state, &recv_seq, &recv_magic);
@@ -530,6 +578,11 @@ static void example_espnow_deinit(example_espnow_send_param_t *send_param)
         xTimerDelete(s_master_led_off_timer, portMAX_DELAY);
         s_master_led_off_timer = NULL;
     }
+    if (s_button_led_off_timer != NULL) {
+        xTimerStop(s_button_led_off_timer, portMAX_DELAY);
+        xTimerDelete(s_button_led_off_timer, portMAX_DELAY);
+        s_button_led_off_timer = NULL;
+    }
     gpio_isr_handler_remove(MASTER_TRIGGER_GPIO);
     if (s_master_i2s_tx_chan != NULL) {
         esp_err_t err = i2s_channel_disable(s_master_i2s_tx_chan);
@@ -557,6 +610,7 @@ void app_main(void)
     ESP_ERROR_CHECK( ret );
 
     example_master_led_init();
+    button_led_init();
     example_master_buzzer_init();
     example_wifi_init();
     example_espnow_init();
