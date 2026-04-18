@@ -82,10 +82,12 @@ static QueueHandle_t s_example_espnow_queue = NULL;
 static TimerHandle_t s_master_led_off_timer = NULL;
 static TimerHandle_t s_button_led_off_timer = NULL;
 static bool s_master_buzzer_inited = false;
-static const uint8_t s_example_fixed_peer_mac[ESP_NOW_ETH_ALEN] = { 0x10, 0x00, 0x3b, 0xcd, 0xd9, 0xbd };
+static const uint8_t s_example_fixed_peer_mac[ESP_NOW_ETH_ALEN] = { 0x10, 0x00, 0x3b, 0xcd, 0xd9, 0xbd }; // Green
+// static const uint8_t s_example_fixed_peer_mac[ESP_NOW_ETH_ALEN] = { 0x38, 0x44, 0xbe, 0x44, 0x08, 0xcd }; // Blue
 static volatile TickType_t s_last_gpio_trigger_tick = 0;
 static i2s_chan_handle_t s_master_i2s_tx_chan = NULL;
 static int16_t s_master_beep_pcm[MASTER_I2S_PLAYBACK_SAMPLES * 2];
+static bool button_pressed = false;
 #if MASTER_BUZZER_USE_STATIC_HEADER_TABLE
 static const uint16_t s_master_error_beep_samples[MASTER_BUZZER_NUM_SAMPLES] = {
 #include "master_error_beep_samples.h"
@@ -496,10 +498,7 @@ static void example_espnow_task(void *pvParameter)
             case EXAMPLE_ESPNOW_RECV_CB:
             {
                 example_espnow_event_recv_cb_t *recv_cb = &evt.info.recv_cb;
-                example_master_led_blink();
-                button_blink();
                 
-
                 ret = example_espnow_data_parse(recv_cb->data, recv_cb->data_len, &recv_state, &recv_seq, &recv_magic);
                 free(recv_cb->data);
                 if (ret < 0) {
@@ -531,15 +530,20 @@ static void example_espnow_task(void *pvParameter)
                 if (MODE == MODE_TX)
                     break;
 
-                memcpy(send_param->dest_mac, recv_cb->mac_addr, ESP_NOW_ETH_ALEN);
-                example_espnow_data_prepare(send_param);
-                esp_err_t send_ret = esp_now_send(send_param->dest_mac, send_param->buffer, send_param->len);
-                if (send_ret != ESP_OK) {
-                    ESP_LOGE(TAG, "Send error: %s (%d)", esp_err_to_name(send_ret), send_ret);
-                    example_espnow_deinit(send_param);
-                    vTaskDelete(NULL);
+                if (!button_pressed) {
+                    button_pressed = true;
+                    memcpy(send_param->dest_mac, recv_cb->mac_addr, ESP_NOW_ETH_ALEN);
+                    example_espnow_data_prepare(send_param);
+                    esp_err_t send_ret = esp_now_send(send_param->dest_mac, send_param->buffer, send_param->len);
+                    if (send_ret != ESP_OK) {
+                        ESP_LOGE(TAG, "Send error: %s (%d)", esp_err_to_name(send_ret), send_ret);
+                        example_espnow_deinit(send_param);
+                        vTaskDelete(NULL);
+                    }
+                    example_master_led_blink();
+                    button_blink();
+                    example_master_buzzer_beep_1s();
                 }
-                example_master_buzzer_beep_1s();
 
                 break;
             }
@@ -548,6 +552,7 @@ static void example_espnow_task(void *pvParameter)
             {
                 ESP_LOGI(TAG, "GPIO0 button pressed");
                 if (MODE == MODE_RX) {
+                    button_pressed = false;
                     ESP_LOGI(TAG, "MODE_RX EXIT");
                     break;
                 }
