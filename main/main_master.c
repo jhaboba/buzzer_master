@@ -25,12 +25,29 @@
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
+#include "esp_err.h"
 #include "esp_mac.h"
 #include "esp_now.h"
 #include "esp_crc.h"
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
 #include "espnow_example.h"
+
+#ifndef MODE_TX
+#define MODE_TX 1
+#endif
+#ifndef MODE_RX
+#define MODE_RX 2
+#endif
+#ifndef MODE
+#define MODE MODE_RX
+#endif
+#ifndef MODE_STR
+#define MODE_STR "RX"
+#endif
+#if (MODE != MODE_TX) && (MODE != MODE_RX)
+#error "MODE must be MODE_TX or MODE_RX"
+#endif
 
 #define ESPNOW_MAXDELAY 512
 #define MASTER_LED_GPIO GPIO_NUM_8
@@ -65,6 +82,7 @@ static QueueHandle_t s_example_espnow_queue = NULL;
 static TimerHandle_t s_master_led_off_timer = NULL;
 static TimerHandle_t s_button_led_off_timer = NULL;
 static bool s_master_buzzer_inited = false;
+static const uint8_t s_example_fixed_peer_mac[ESP_NOW_ETH_ALEN] = { 0x10, 0x00, 0x3b, 0xcd, 0xd9, 0xbd };
 static volatile TickType_t s_last_gpio_trigger_tick = 0;
 static i2s_chan_handle_t s_master_i2s_tx_chan = NULL;
 static int16_t s_master_beep_pcm[MASTER_I2S_PLAYBACK_SAMPLES * 2];
@@ -329,14 +347,27 @@ static void example_wifi_init(void)
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK( esp_wifi_init(&cfg) );
     ESP_ERROR_CHECK( esp_wifi_set_storage(WIFI_STORAGE_RAM) );
+#if MODE == MODE_TX
+    ESP_ERROR_CHECK( esp_wifi_set_mode(WIFI_MODE_STA) );
+#else
     ESP_ERROR_CHECK( esp_wifi_set_mode(WIFI_MODE_AP) );
+#endif
     ESP_ERROR_CHECK( esp_wifi_start());
     ESP_ERROR_CHECK( esp_wifi_set_channel(CONFIG_ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
+#if MODE == MODE_TX
+    ESP_ERROR_CHECK( esp_wifi_get_mac(ESP_IF_WIFI_STA, s_example_ap_mac) );
+    ESP_LOGI(TAG, "--- MASTER APP Local STA MAC: "MACSTR, MAC2STR(s_example_ap_mac));
+#else
     ESP_ERROR_CHECK( esp_wifi_get_mac(ESP_IF_WIFI_AP, s_example_ap_mac) );
     ESP_LOGI(TAG, "--- MASTER APP Local AP MAC: "MACSTR, MAC2STR(s_example_ap_mac));
+#endif
 
 #if CONFIG_ESPNOW_ENABLE_LONG_RANGE
+#if MODE == MODE_TX
+    ESP_ERROR_CHECK( esp_wifi_set_protocol(ESP_IF_WIFI_STA, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N|WIFI_PROTOCOL_LR) );
+#else
     ESP_ERROR_CHECK( esp_wifi_set_protocol(ESP_IF_WIFI_AP, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N|WIFI_PROTOCOL_LR) );
+#endif
 #endif
 }
 
@@ -461,6 +492,7 @@ static void example_espnow_task(void *pvParameter)
                 ESP_LOGD(TAG, "Send data to "MACSTR", status: %d", MAC2STR(send_cb->mac_addr), send_cb->status);
                 break;
             }
+
             case EXAMPLE_ESPNOW_RECV_CB:
             {
                 example_espnow_event_recv_cb_t *recv_cb = &evt.info.recv_cb;
@@ -495,10 +527,15 @@ static void example_espnow_task(void *pvParameter)
                     free(peer);
                 }
 
+                // Dont send response in Tx mode
+                if (MODE == MODE_TX)
+                    break;
+
                 memcpy(send_param->dest_mac, recv_cb->mac_addr, ESP_NOW_ETH_ALEN);
                 example_espnow_data_prepare(send_param);
-                if (esp_now_send(send_param->dest_mac, send_param->buffer, send_param->len) != ESP_OK) {
-                    ESP_LOGE(TAG, "Send error");
+                esp_err_t send_ret = esp_now_send(send_param->dest_mac, send_param->buffer, send_param->len);
+                if (send_ret != ESP_OK) {
+                    ESP_LOGE(TAG, "Send error: %s (%d)", esp_err_to_name(send_ret), send_ret);
                     example_espnow_deinit(send_param);
                     vTaskDelete(NULL);
                 }
@@ -506,9 +543,30 @@ static void example_espnow_task(void *pvParameter)
 
                 break;
             }
+
             case EXAMPLE_ESPNOW_GPIO_CB:
             {
                 ESP_LOGI(TAG, "GPIO0 button pressed");
+                if (MODE == MODE_RX) {
+                    ESP_LOGI(TAG, "MODE_RX EXIT");
+                    break;
+                }
+
+                // if (gpio_get_level(MASTER_TRIGGER_GPIO) != 0) {
+                //     ESP_LOGI(TAG, "LEVEL 1 EXIT");
+                //     break;
+                // }
+
+                memcpy(send_param->dest_mac, s_example_fixed_peer_mac, ESP_NOW_ETH_ALEN);
+                example_espnow_data_prepare(send_param);
+                esp_err_t send_ret = esp_now_send(send_param->dest_mac, send_param->buffer, send_param->len);
+                if (send_ret != ESP_OK) {
+                    ESP_LOGE(TAG, "Send error: %s (%d)", esp_err_to_name(send_ret), send_ret);
+                    example_espnow_deinit(send_param);
+                    vTaskDelete(NULL);
+                } else {
+                    ESP_LOGI(TAG, "GPIO0 low -> sent packet to "MACSTR, MAC2STR(send_param->dest_mac));
+                }
                 break;
             }
             default:
@@ -537,6 +595,25 @@ static esp_err_t example_espnow_init(void)
     ESP_ERROR_CHECK( esp_now_set_wake_window(CONFIG_ESPNOW_WAKE_WINDOW) );
     ESP_ERROR_CHECK( esp_wifi_connectionless_module_set_wake_interval(CONFIG_ESPNOW_WAKE_INTERVAL) );
 #endif
+#if MODE == MODE_TX
+    if (!esp_now_is_peer_exist(s_example_fixed_peer_mac)) {
+        esp_now_peer_info_t *peer = malloc(sizeof(esp_now_peer_info_t));
+        if (peer == NULL) {
+            ESP_LOGE(TAG, "Malloc peer information fail");
+            vQueueDelete(s_example_espnow_queue);
+            s_example_espnow_queue = NULL;
+            esp_now_deinit();
+            return ESP_FAIL;
+        }
+        memset(peer, 0, sizeof(esp_now_peer_info_t));
+        peer->channel = CONFIG_ESPNOW_CHANNEL;
+        peer->ifidx = ESP_IF_WIFI_STA;
+        peer->encrypt = false;
+        memcpy(peer->peer_addr, s_example_fixed_peer_mac, ESP_NOW_ETH_ALEN);
+        ESP_ERROR_CHECK( esp_now_add_peer(peer) );
+        free(peer);
+    }
+#endif
     /* Initialize sending parameters. */
     send_param = malloc(sizeof(example_espnow_send_param_t));
     if (send_param == NULL) {
@@ -563,7 +640,11 @@ static esp_err_t example_espnow_init(void)
         esp_now_deinit();
         return ESP_FAIL;
     }
+#if MODE == MODE_TX
+    memcpy(send_param->dest_mac, s_example_fixed_peer_mac, ESP_NOW_ETH_ALEN);
+#else
     memset(send_param->dest_mac, 0, ESP_NOW_ETH_ALEN);
+#endif
     example_espnow_data_prepare(send_param);
 
     xTaskCreate(example_espnow_task, "example_espnow_task", 2560, send_param, 4, NULL);
@@ -608,6 +689,7 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK( ret );
+    ESP_LOGI(TAG, "Build MODE: %s", MODE_STR);
 
     example_master_led_init();
     button_led_init();

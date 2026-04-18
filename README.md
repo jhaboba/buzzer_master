@@ -55,7 +55,12 @@ idf.py menuconfig
 Build the project and flash it to the board, then run monitor tool to view serial output:
 
 ```
-idf.py -p PORT flash monitor
+idf.py -B build_tx -DMODE=TX build
+idf.py -B build_tx -DMODE=TX -p COM7 flash monitor
+
+idf.py -B build_rx -DMODE=RX build
+idf.py -B build_rx -DMODE=RX -p COM7 flash monitor
+
 ```
 
 (To exit the serial monitor, type ``Ctrl-]``.)
