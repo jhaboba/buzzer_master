@@ -67,7 +67,7 @@
 #define MASTER_BUZZER_SAMPLE_RATE_HZ 1000
 #define MASTER_BUZZER_NUM_SAMPLES 1000
 #define MASTER_BUZZER_DUTY_CENTER 512
-#define MASTER_BUZZER_DYNAMIC_PCM_PEAK 32000
+#define MASTER_BUZZER_DYNAMIC_PCM_PEAK 32767
 #define MASTER_BUZZER_USE_STATIC_HEADER_TABLE 0
 #define MASTER_BUZZER_PI 3.14159265358979323846f
 #define MASTER_BUZZER_DYNAMIC_FREQ1_HZ 220.0f
@@ -75,6 +75,29 @@
 #define MASTER_BUZZER_DYNAMIC_T_FS_HZ 1000.0f
 #define MASTER_BEEP_DURATION_MS 1000
 #define MASTER_I2S_PLAYBACK_SAMPLES ((MASTER_I2S_SAMPLE_RATE_HZ * MASTER_BEEP_DURATION_MS) / 1000)
+#define MASTER_CLOCK_SOUND_DURATION_MS 5000
+#define MASTER_CLOCK_TICK_INTERVAL_MS 500
+#define MASTER_CLOCK_TICK_MS 35
+#define MASTER_CLOCK_TICKS (MASTER_CLOCK_SOUND_DURATION_MS / MASTER_CLOCK_TICK_INTERVAL_MS)
+#define MASTER_CLOCK_TICK_SAMPLES ((MASTER_I2S_SAMPLE_RATE_HZ * MASTER_CLOCK_TICK_MS) / 1000)
+#define MASTER_CLOCK_INTERVAL_SAMPLES ((MASTER_I2S_SAMPLE_RATE_HZ * MASTER_CLOCK_TICK_INTERVAL_MS) / 1000)
+#define MASTER_CLOCK_SILENCE_SAMPLES (MASTER_CLOCK_INTERVAL_SAMPLES - MASTER_CLOCK_TICK_SAMPLES)
+#define MASTER_CLOCK_TICK_FREQ1_HZ 2300.0f
+#define MASTER_CLOCK_TICK_FREQ2_HZ 1450.0f
+#define MASTER_CLOCK_TICK_GAIN 32767.0f
+#define MASTER_BELL_DURATION_MS 1000
+#define MASTER_BELL_SAMPLES ((MASTER_I2S_SAMPLE_RATE_HZ * MASTER_BELL_DURATION_MS) / 1000)
+#define MASTER_BELL_FREQ1_HZ 700.0f
+#define MASTER_BELL_FREQ2_HZ 1030.0f
+#define MASTER_BELL_FREQ3_HZ 1450.0f
+#define MASTER_BELL_FREQ4_HZ 2200.0f
+#define MASTER_BELL_FREQ5_HZ 2850.0f
+#define MASTER_BELL_GAIN 32767.0f
+#define MASTER_BELL_BODY_DECAY 0.0f //1.3f
+#define MASTER_BELL_STRIKE_INTERVAL_S 0.075f
+#define MASTER_BELL_STRIKE_DECAY 46.0f
+#define MASTER_BELL_STRIKE_COUNT 128
+#define MASTER_PCM_PREP_YIELD_INTERVAL 128
 
 static const char *TAG = "espnow_example";
 
@@ -87,6 +110,8 @@ static const uint8_t s_example_fixed_peer_mac[ESP_NOW_ETH_ALEN] = { 0x10, 0x00, 
 static volatile TickType_t s_last_gpio_trigger_tick = 0;
 static i2s_chan_handle_t s_master_i2s_tx_chan = NULL;
 static int16_t s_master_beep_pcm[MASTER_I2S_PLAYBACK_SAMPLES * 2];
+static int16_t s_master_clock_tick_pcm[MASTER_CLOCK_TICK_SAMPLES * 2];
+static int16_t s_master_bell_pcm[MASTER_BELL_SAMPLES * 2];
 static bool button_pressed = false;
 #if MASTER_BUZZER_USE_STATIC_HEADER_TABLE
 static const uint16_t s_master_error_beep_samples[MASTER_BUZZER_NUM_SAMPLES] = {
@@ -102,12 +127,17 @@ static void example_espnow_deinit(example_espnow_send_param_t *send_param);
 static void example_master_led_init(void);
 static void example_master_led_blink(void);
 static void button_led_init(void);
-static void button_blink(void);
+static void button_blink(int sec);
 static void example_master_gpio_init(void);
 static void example_master_buzzer_init(void);
 static void example_master_buzzer_prepare_table(void);
 static void example_master_buzzer_prepare_pcm(void);
+static void example_master_clock_prepare_pcm(void);
+static void example_master_bell_prepare_pcm(void);
+static esp_err_t example_master_i2s_write_frames(const int16_t *stereo_pcm, size_t frames, TickType_t timeout_ticks);
+static esp_err_t example_master_i2s_write_silence(size_t frames, TickType_t timeout_ticks);
 void example_master_buzzer_beep_1s(void);
+void example_master_clock_ticking_5s(void);
 
 static void example_master_led_off_timer_cb(TimerHandle_t xTimer)
 {
@@ -178,14 +208,25 @@ static void button_led_init(void)
     }
 }
 
-static void button_blink(void)
+static void button_blink(int sec)
 {
+    TickType_t blink_ticks;
+
     if (s_button_led_off_timer == NULL) {
         return;
+    }
+    if (sec <= 0) {
+        sec = 1;
+    }
+
+    blink_ticks = pdMS_TO_TICKS((uint32_t)sec * 1000U);
+    if (blink_ticks == 0) {
+        blink_ticks = 1;
     }
 
     ESP_ERROR_CHECK(gpio_set_level(BUTTON_LED_GPIO, BUTTON_LED_ON_LEVEL));
     xTimerStop(s_button_led_off_timer, 0);
+    xTimerChangePeriod(s_button_led_off_timer, blink_ticks, 0);
     xTimerStart(s_button_led_off_timer, 0);
 }
 
@@ -259,6 +300,8 @@ static void example_master_buzzer_init(void)
 
     example_master_buzzer_prepare_table();
     example_master_buzzer_prepare_pcm();
+    example_master_clock_prepare_pcm();
+    example_master_bell_prepare_pcm();
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &s_master_i2s_tx_chan, NULL));
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_master_i2s_tx_chan, &std_cfg));
     s_master_buzzer_inited = true;
@@ -282,6 +325,10 @@ static void example_master_buzzer_prepare_table(void)
         }
 
         s_master_error_beep_samples[i] = (int16_t)pcm;
+
+        if ((i % MASTER_PCM_PREP_YIELD_INTERVAL) == 0) {
+            vTaskDelay(1);
+        }
     }
 #endif
 }
@@ -302,12 +349,163 @@ static void example_master_buzzer_prepare_pcm(void)
 #endif
         s_master_beep_pcm[(i * 2)] = pcm_sample;
         s_master_beep_pcm[(i * 2) + 1] = pcm_sample;
+
+        if ((i % MASTER_PCM_PREP_YIELD_INTERVAL) == 0) {
+            vTaskDelay(1);
+        }
     }
+}
+
+static void example_master_clock_prepare_pcm(void)
+{
+    const float w1 = 2.0f * MASTER_BUZZER_PI * MASTER_CLOCK_TICK_FREQ1_HZ;
+    const float w2 = 2.0f * MASTER_BUZZER_PI * MASTER_CLOCK_TICK_FREQ2_HZ;
+
+    for (size_t i = 0; i < MASTER_CLOCK_TICK_SAMPLES; i++) {
+        float t = (float)i / (float)MASTER_I2S_SAMPLE_RATE_HZ;
+        float env = expf(-70.0f * t);
+        float wave = sinf(w1 * t) + (0.55f * sinf(w2 * t));
+        int32_t pcm = (int32_t)(wave * env * MASTER_CLOCK_TICK_GAIN);
+
+        if (pcm < INT16_MIN) {
+            pcm = INT16_MIN;
+        } else if (pcm > INT16_MAX) {
+            pcm = INT16_MAX;
+        }
+        s_master_clock_tick_pcm[(i * 2)] = (int16_t)pcm;
+        s_master_clock_tick_pcm[(i * 2) + 1] = (int16_t)pcm;
+
+        if ((i % MASTER_PCM_PREP_YIELD_INTERVAL) == 0) {
+            vTaskDelay(1);
+        }
+    }
+}
+
+static void example_master_bell_prepare_pcm(void)
+{
+    const float w1 = 2.0f * MASTER_BUZZER_PI * MASTER_BELL_FREQ1_HZ;
+    const float w2 = 2.0f * MASTER_BUZZER_PI * MASTER_BELL_FREQ2_HZ;
+    const float w3 = 2.0f * MASTER_BUZZER_PI * MASTER_BELL_FREQ3_HZ;
+    const float w4 = 2.0f * MASTER_BUZZER_PI * MASTER_BELL_FREQ4_HZ;
+    const float w5 = 2.0f * MASTER_BUZZER_PI * MASTER_BELL_FREQ5_HZ;
+    const float body_step = expf(-MASTER_BELL_BODY_DECAY / (float)MASTER_I2S_SAMPLE_RATE_HZ);
+    const float strike_step = expf(-MASTER_BELL_STRIKE_DECAY / (float)MASTER_I2S_SAMPLE_RATE_HZ);
+    size_t strike_interval_samples = (size_t)(MASTER_BELL_STRIKE_INTERVAL_S * (float)MASTER_I2S_SAMPLE_RATE_HZ);
+    size_t next_strike_sample = 0;
+    int strikes_done = 0;
+    float body_env = 1.0f;
+    float strike_env = 0.0f;
+
+    if (strike_interval_samples == 0) {
+        strike_interval_samples = 1;
+    }
+
+    for (size_t i = 0; i < MASTER_BELL_SAMPLES; i++) {
+        float t = (float)i / (float)MASTER_I2S_SAMPLE_RATE_HZ;
+        float striker;
+        float metallic;
+        float drive;
+        int32_t pcm;
+
+        if (strikes_done < MASTER_BELL_STRIKE_COUNT && i == next_strike_sample) {
+            strike_env += 1.0f;
+            strikes_done++;
+            next_strike_sample += strike_interval_samples;
+        }
+
+        striker = strike_env;
+        if (striker > 1.0f) {
+            striker = 1.0f;
+        }
+
+        metallic = (0.48f * sinf(w1 * t))
+                 + (0.33f * sinf(w2 * t))
+                 + (0.24f * sinf(w3 * t))
+                 + (0.17f * sinf(w4 * t))
+                 + (0.09f * sinf(w5 * t));
+
+        drive = striker * body_env;
+
+        pcm = (int32_t)(metallic * drive * MASTER_BELL_GAIN);
+
+        if (pcm < INT16_MIN) {
+            pcm = INT16_MIN;
+        } else if (pcm > INT16_MAX) {
+            pcm = INT16_MAX;
+        }
+
+        s_master_bell_pcm[(i * 2)] = (int16_t)pcm;
+        s_master_bell_pcm[(i * 2) + 1] = (int16_t)pcm;
+
+        strike_env *= strike_step;
+        body_env *= body_step;
+
+        if ((i % MASTER_PCM_PREP_YIELD_INTERVAL) == 0) {
+            vTaskDelay(1);
+        }
+    }
+}
+
+static esp_err_t example_master_i2s_write_frames(const int16_t *stereo_pcm, size_t frames, TickType_t timeout_ticks)
+{
+    const uint8_t *buf = (const uint8_t *)stereo_pcm;
+    size_t remaining = frames * 2 * sizeof(int16_t);
+    int timeout_streak = 0;
+
+    while (remaining > 0) {
+        size_t bytes_written = 0;
+        esp_err_t err = i2s_channel_write(s_master_i2s_tx_chan, buf, remaining, &bytes_written, timeout_ticks);
+
+        if (bytes_written > 0) {
+            buf += bytes_written;
+            if (bytes_written >= remaining) {
+                remaining = 0;
+            } else {
+                remaining -= bytes_written;
+            }
+            timeout_streak = 0;
+            continue;
+        }
+
+        if (err == ESP_OK) {
+            continue;
+        }
+        if (err == ESP_ERR_TIMEOUT) {
+            timeout_streak++;
+            if (timeout_streak > 10) {
+                return err;
+            }
+            vTaskDelay(pdMS_TO_TICKS(2));
+            continue;
+        }
+        return err;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t example_master_i2s_write_silence(size_t frames, TickType_t timeout_ticks)
+{
+    static const int16_t s_silence_chunk[256 * 2] = { 0 };
+
+    while (frames > 0) {
+        size_t frames_chunk = frames;
+        if (frames_chunk > 256) {
+            frames_chunk = 256;
+        }
+
+        esp_err_t err = example_master_i2s_write_frames(s_silence_chunk, frames_chunk, timeout_ticks);
+        if (err != ESP_OK) {
+            return err;
+        }
+        frames -= frames_chunk;
+    }
+
+    return ESP_OK;
 }
 
 void example_master_buzzer_beep_1s(void)
 {
-    size_t bytes_written = 0;
     static const int16_t s_silence_tail[128] = { 0 };
     esp_err_t err;
 
@@ -324,16 +522,55 @@ void example_master_buzzer_beep_1s(void)
         ESP_ERROR_CHECK(err);
     }
 
-    ESP_ERROR_CHECK(i2s_channel_write(s_master_i2s_tx_chan,
-                                      s_master_beep_pcm,
-                                      sizeof(s_master_beep_pcm),
-                                      &bytes_written,
-                                      pdMS_TO_TICKS(1200)));
-    ESP_ERROR_CHECK(i2s_channel_write(s_master_i2s_tx_chan,
-                                      s_silence_tail,
-                                      sizeof(s_silence_tail),
-                                      &bytes_written,
-                                      pdMS_TO_TICKS(50)));
+    err = example_master_i2s_write_frames(s_master_beep_pcm, MASTER_I2S_PLAYBACK_SAMPLES, pdMS_TO_TICKS(1200));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Buzzer write timeout/error: %s (%d)", esp_err_to_name(err), err);
+    }
+    err = example_master_i2s_write_frames(s_silence_tail, 128, pdMS_TO_TICKS(50));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Buzzer silence write timeout/error: %s (%d)", esp_err_to_name(err), err);
+    }
+
+    err = i2s_channel_disable(s_master_i2s_tx_chan);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(err);
+    }
+}
+
+void example_master_clock_ticking_5s(void)
+{
+    esp_err_t err;
+
+    if (!s_master_buzzer_inited) {
+        example_master_buzzer_init();
+    }
+    if (s_master_i2s_tx_chan == NULL) {
+        return;
+    }
+
+    err = i2s_channel_enable(s_master_i2s_tx_chan);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(err);
+    }
+
+    for (size_t i = 0; i < MASTER_CLOCK_TICKS; i++) {
+        err = example_master_i2s_write_frames(s_master_clock_tick_pcm, MASTER_CLOCK_TICK_SAMPLES, pdMS_TO_TICKS(200));
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Clock tick write timeout/error: %s (%d)", esp_err_to_name(err), err);
+            break;
+        }
+        err = example_master_i2s_write_silence(MASTER_CLOCK_SILENCE_SAMPLES, pdMS_TO_TICKS(600));
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Clock silence write timeout/error: %s (%d)", esp_err_to_name(err), err);
+            break;
+        }
+    }
+    if (err == ESP_OK) {
+        err = example_master_i2s_write_frames(s_master_bell_pcm, MASTER_BELL_SAMPLES, pdMS_TO_TICKS(1500));
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Bell write timeout/error: %s (%d)", esp_err_to_name(err), err);
+        }
+    }
 
     err = i2s_channel_disable(s_master_i2s_tx_chan);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
@@ -527,8 +764,11 @@ static void example_espnow_task(void *pvParameter)
                 }
 
                 // Dont send response in Tx mode
-                if (MODE == MODE_TX)
+                if (MODE == MODE_TX) {
+                    button_blink(5);
+                    example_master_clock_ticking_5s();
                     break;
+                }
 
                 if (!button_pressed) {
                     button_pressed = true;
@@ -541,7 +781,7 @@ static void example_espnow_task(void *pvParameter)
                         vTaskDelete(NULL);
                     }
                     example_master_led_blink();
-                    button_blink();
+                    button_blink(1);
                     example_master_buzzer_beep_1s();
                 }
 
